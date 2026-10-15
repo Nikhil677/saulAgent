@@ -1,235 +1,134 @@
-"""Assistant payload builder and registration engine for Vapi Negotiator.
+"""Build and register Vapi assistants + phone numbers (idempotent bootstrap).
 
-Constructs Vapi-compliant assistant specifications for both buyer and vendor personas,
-configures speech synthesis, LLM parameters, webhooks, and syncs them with Vapi API and local store.
+Creates:
+  * one BUYER assistant (the negotiator) + one outbound phone number
+  * one assistant per SIMULATED vendor, each attached to its own free Vapi number,
+    so the buyer can phone it exactly like a real shop.
+
+Ids are saved in state/state.json so re-running updates instead of duplicating.
 """
-
 from __future__ import annotations
 
-import logging
-from typing import Any, Dict, List, Optional
+import asyncio
+from typing import Any
 
-from app.models import Brief, VendorPersona
-from app.prompts import build_analysis_prompt, build_buyer_prompt, build_vendor_prompt
-from app.store import Store
-from app.vapi_client import VapiClient
+from .config import Settings
+from .prompts import BUYER_FIRST_MESSAGE, BUYER_SYSTEM_PROMPT, build_vendor_prompt
+from .store import JsonStore
+from .vapi_client import VapiClient, VapiError
 
-logger = logging.getLogger(__name__)
+SERVER_MESSAGES = ["status-update", "transcript", "end-of-call-report", "hang"]
 
 
-def build_buyer_assistant_payload(
-    brief: Dict[str, Any],
-    webhook_url: Optional[str] = None,
-    webhook_secret: Optional[str] = None,
-    provider: str = "openai",
-    model: str = "gpt-4o",
-    temperature: float = 0.7,
-) -> Dict[str, Any]:
-    """Construct Vapi assistant configuration for the AI Buyer Agent."""
-    prompt = build_buyer_prompt(brief)
-    item_name = brief.get("item", "Server Racks")
-    quantity = brief.get("quantity", 50)
+# --------------------------------------------------------------------- blocks
+def _model_block(s: Settings, system_prompt: str, temperature: float) -> dict:
+    if not s.llm_model:
+        raise ValueError("Set VAPI_LLM_MODEL in .env (copy a valid model name from the Vapi dashboard).")
+    return {
+        "provider": s.llm_provider,
+        "model": s.llm_model,
+        "temperature": temperature,
+        "messages": [{"role": "system", "content": system_prompt}],
+    }
 
-    payload: Dict[str, Any] = {
-        "name": f"Buyer Agent - Alex Mercer ({item_name[:25]})",
-        "model": {
-            "provider": provider,
-            "model": model,
-            "temperature": temperature,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": prompt,
-                }
-            ],
-        },
-        "voice": {
-            "provider": "11labs",
-            "voiceId": "burt",  # Professional, confident tone
-        },
-        "firstMessage": (
-            f"Hello, this is Alex Mercer calling from Nexor Infrastructure. "
-            f"I'm reaching out regarding a procurement requirement for {quantity} units of {item_name}. "
-            f"Are you the right person to speak with on commercial volume pricing?"
-        ),
+
+def _transcriber_block(s: Settings) -> dict:
+    return {"provider": s.transcriber_provider, "model": s.transcriber_model,
+            "language": s.transcriber_language}
+
+
+def _server_block(s: Settings) -> dict:
+    """Webhook config. If your Vapi version expects a nested `server` object instead of the
+    flat serverUrl/serverUrlSecret fields, change it here: this is the only place."""
+    if not s.webhook_url:
+        return {}
+    block: dict[str, Any] = {"serverUrl": s.webhook_url, "serverMessages": SERVER_MESSAGES}
+    if s.webhook_secret:
+        block["serverUrlSecret"] = s.webhook_secret
+    return block
+
+
+# ----------------------------------------------------------------- assistants
+def build_buyer_assistant(s: Settings) -> dict:
+    return {
+        "name": "negotiator-buyer",
+        "firstMessage": BUYER_FIRST_MESSAGE,
+        "model": _model_block(s, BUYER_SYSTEM_PROMPT, temperature=0.4),
+        "voice": {"provider": s.buyer_voice_provider, "voiceId": s.buyer_voice_id},
+        "transcriber": _transcriber_block(s),
+        "maxDurationSeconds": s.max_call_seconds,
+        "silenceTimeoutSeconds": s.silence_timeout_seconds,
         "endCallFunctionEnabled": True,
-        "recordingEnabled": True,
-        "silenceTimeoutSeconds": 25,
-        "maxDurationSeconds": 600,
+        "backgroundDenoisingEnabled": True,
+        **_server_block(s),
     }
 
-    if webhook_url:
-        payload["serverUrl"] = webhook_url
-    if webhook_secret:
-        payload["serverUrlSecret"] = webhook_secret
 
-    payload["analysisPlan"] = {
-        "summaryPrompt": (
-            "Provide a concise 2-to-3 sentence summary of the negotiation call, "
-            "noting whether a deal was struck, the final agreed unit price, and key agreed delivery/payment terms."
-        ),
-        "structuredDataPrompt": build_analysis_prompt(brief),
-        "structuredDataSchema": {
-            "type": "object",
-            "properties": {
-                "deal_reached": {"type": "boolean"},
-                "final_unit_price": {"type": "number"},
-                "agreed_quantity": {"type": "integer"},
-                "total_contract_value": {"type": "number"},
-                "agreed_delivery": {"type": "string"},
-                "agreed_payment_terms": {"type": "string"},
-                "agreed_warranty_years": {"type": "integer"},
-                "outcome_summary": {"type": "string"},
-            },
-            "required": ["deal_reached"],
-        },
-    }
-
-    return payload
-
-
-def build_vendor_assistant_payload(
-    vendor: Dict[str, Any],
-    brief: Dict[str, Any],
-    webhook_url: Optional[str] = None,
-    webhook_secret: Optional[str] = None,
-    provider: str = "openai",
-    model: str = "gpt-4o",
-    temperature: float = 0.7,
-) -> Dict[str, Any]:
-    """Construct Vapi assistant configuration for a simulated AI Vendor Sales Rep."""
-    prompt = build_vendor_prompt(vendor, brief)
-    voice_config = vendor.get("voice", {"provider": "11labs", "voiceId": "burt"})
-
-    payload: Dict[str, Any] = {
-        "name": f"Vendor Agent - {vendor.get('name')} ({vendor.get('contact_name')})",
-        "model": {
-            "provider": provider,
-            "model": model,
-            "temperature": temperature,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": prompt,
-                }
-            ],
-        },
-        "voice": voice_config,
-        "firstMessage": (
-            f"Hello, thank you for calling {vendor.get('name')}. "
-            f"This is {vendor.get('contact_name')}, {vendor.get('contact_title')}. "
-            f"How can I help you with your equipment procurement today?"
-        ),
+def build_vendor_assistant(s: Settings, vendor: dict) -> dict:
+    return {
+        "name": f"sim-vendor-{vendor['id']}",
+        # Vendor waits for the buyer's greeting; otherwise both would talk at the same time.
+        "firstMessageMode": "assistant-waits-for-user",
+        "model": _model_block(s, build_vendor_prompt(vendor), temperature=0.7),
+        "voice": {"provider": s.vendor_voice_provider, "voiceId": vendor.get("voice_id", s.vendor_voice_id)},
+        "transcriber": _transcriber_block(s),
+        "maxDurationSeconds": s.max_call_seconds + 30,
+        "silenceTimeoutSeconds": s.silence_timeout_seconds,
         "endCallFunctionEnabled": True,
-        "recordingEnabled": True,
-        "silenceTimeoutSeconds": 25,
-        "maxDurationSeconds": 600,
+        "backgroundDenoisingEnabled": True,
+        # Vendors do not send webhooks: only the buyer's call is recorded.
     }
 
-    if webhook_url:
-        payload["serverUrl"] = webhook_url
-    if webhook_secret:
-        payload["serverUrlSecret"] = webhook_secret
 
-    payload["analysisPlan"] = {
-        "summaryPrompt": (
-            f"Summarize the negotiation from the perspective of {vendor.get('name')}, "
-            f"stating if the deal closed, final agreed price, and if margins held above floor."
-        ),
-    }
-
-    return payload
-
-
-async def register_all_assistants(
-    vapi_client: VapiClient,
-    store: Store,
-    brief: Dict[str, Any],
-    vendors: List[Dict[str, Any]],
-    webhook_url: Optional[str] = None,
-    webhook_secret: Optional[str] = None,
-    provider: str = "openai",
-    model: str = "gpt-4o",
-) -> Dict[str, Any]:
-    """Register or update both buyer and vendor assistants on Vapi and save IDs to store."""
-    results: Dict[str, Any] = {
-        "buyer": None,
-        "vendors": {},
-    }
-
-    # 1. Register / Update Buyer Assistant
-    existing_buyer = await store.get_buyer_assistant()
-    buyer_payload = build_buyer_assistant_payload(
-        brief=brief,
-        webhook_url=webhook_url,
-        webhook_secret=webhook_secret,
-        provider=provider,
-        model=model,
-    )
-
-    try:
-        if existing_buyer and existing_buyer.get("id"):
-            buyer_id = existing_buyer["id"]
-            logger.info("Updating existing buyer assistant: %s", buyer_id)
-            updated = await vapi_client.update_assistant(buyer_id, buyer_payload)
-            buyer_data = {
-                "id": buyer_id,
-                "name": updated.get("name", buyer_payload["name"]),
-                "payload": buyer_payload,
-            }
-        else:
-            logger.info("Creating new buyer assistant on Vapi")
-            created = await vapi_client.create_assistant(buyer_payload)
-            buyer_data = {
-                "id": created["id"],
-                "name": created.get("name", buyer_payload["name"]),
-                "payload": buyer_payload,
-            }
-
-        await store.set_buyer_assistant(buyer_data)
-        results["buyer"] = buyer_data
-    except Exception as e:
-        logger.error("Failed to register buyer assistant: %s", e)
-        results["buyer"] = {"error": str(e)}
-
-    # 2. Register / Update Vendor Assistants
-    for vendor in vendors:
-        v_id = vendor["id"]
-        existing_v = await store.get_vendor_assistant(v_id)
-        vendor_payload = build_vendor_assistant_payload(
-            vendor=vendor,
-            brief=brief,
-            webhook_url=webhook_url,
-            webhook_secret=webhook_secret,
-            provider=provider,
-            model=model,
-        )
-
+# ---------------------------------------------------------------- bootstrap
+async def _upsert_assistant(client: VapiClient, existing_id: str | None, payload: dict) -> str:
+    if existing_id:
         try:
-            if existing_v and existing_v.get("id"):
-                v_assistant_id = existing_v["id"]
-                logger.info("Updating existing vendor assistant %s: %s", v_id, v_assistant_id)
-                updated_v = await vapi_client.update_assistant(v_assistant_id, vendor_payload)
-                vendor_data = {
-                    "id": v_assistant_id,
-                    "vendor_id": v_id,
-                    "name": updated_v.get("name", vendor_payload["name"]),
-                    "payload": vendor_payload,
-                }
-            else:
-                logger.info("Creating new vendor assistant for %s on Vapi", v_id)
-                created_v = await vapi_client.create_assistant(vendor_payload)
-                vendor_data = {
-                    "id": created_v["id"],
-                    "vendor_id": v_id,
-                    "name": created_v.get("name", vendor_payload["name"]),
-                    "payload": vendor_payload,
-                }
+            await client.update_assistant(existing_id, payload)
+            return existing_id
+        except VapiError as exc:
+            if exc.status != 404:
+                raise
+    created = await client.create_assistant(payload)
+    return created["id"]
 
-            await store.set_vendor_assistant(v_id, vendor_data)
-            results["vendors"][v_id] = vendor_data
-        except Exception as e:
-            logger.error("Failed to register vendor assistant %s: %s", v_id, e)
-            results["vendors"][v_id] = {"error": str(e)}
 
-    return results
+async def _create_number(client: VapiClient, s: Settings, name: str, assistant_id: str | None) -> dict:
+    """Create a free Vapi (US) number and wait until the E.164 number is assigned."""
+    payload: dict[str, Any] = {"provider": "vapi", "name": name,
+                               "numberDesiredAreaCode": s.number_area_code}
+    if assistant_id:
+        payload["assistantId"] = assistant_id
+    created = await client.create_phone_number(payload)
+    for _ in range(30):  # up to ~60 s
+        if created.get("number"):
+            return created
+        await asyncio.sleep(2)
+        created = await client.get_phone_number(created["id"])
+    raise VapiError(0, f"phone number {created.get('id')} was created but has no number yet")
+
+
+async def bootstrap(client: VapiClient, s: Settings, vendors: list[dict],
+                    store: JsonStore, create_numbers: bool = True) -> dict:
+    state = store.load()
+    state["buyer_assistant_id"] = await _upsert_assistant(
+        client, state.get("buyer_assistant_id"), build_buyer_assistant(s))
+    store.save(state)
+
+    vstate = state.setdefault("vendors", {})
+    for v in vendors:
+        if v.get("mode", "simulated") != "simulated":
+            continue  # real vendors need no assistant
+        entry = vstate.setdefault(v["id"], {})
+        entry["assistant_id"] = await _upsert_assistant(
+            client, entry.get("assistant_id"), build_vendor_assistant(s, v))
+        if create_numbers and not entry.get("phone_number_id"):
+            num = await _create_number(client, s, f"vendor-{v['id']}", entry["assistant_id"])
+            entry["phone_number_id"], entry["number"] = num["id"], num["number"]
+        store.save(state)
+
+    if create_numbers and not state.get("buyer_phone_number_id"):
+        num = await _create_number(client, s, "buyer-outbound", None)
+        state["buyer_phone_number_id"], state["buyer_number"] = num["id"], num["number"]
+        store.save(state)
+    return state

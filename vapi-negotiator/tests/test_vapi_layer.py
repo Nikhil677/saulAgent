@@ -1,298 +1,156 @@
-"""Comprehensive test suite for Vapi Negotiator.
-
-Validates config loading, models, atomic file storage, prompt generation,
-assistant payload building, VapiClient REST communication, webhook event dispatching,
-and call manager outcome classification.
-"""
-
-from __future__ import annotations
-
+"""Offline tests: no network, no Vapi account, no cost.  Run: pytest -q"""
 import asyncio
-import json
-import os
-import tempfile
 from pathlib import Path
+
 import pytest
-import httpx
 from fastapi.testclient import TestClient
 
-from app.assistants import (
-    build_buyer_assistant_payload,
-    build_vendor_assistant_payload,
-)
-from app.call_manager import CallManager
+from app.call_manager import CallManager, classify, normalize_messages
 from app.config import Settings
-from app.main import app
-from app.models import (
-    Brief,
-    CallRecord,
-    CallStatus,
-    NegotiationOutcome,
-    RoundRecord,
-    Turn,
-    VendorPersona,
-)
-from app.prompts import (
-    build_analysis_prompt,
-    build_buyer_prompt,
-    build_vendor_prompt,
-)
-from app.store import Store
-from app.vapi_client import VapiAuthenticationError, VapiClient, VapiNotFoundError
+from app.main import build_manager, create_app
+from app.models import CallStatus, Turn
+from app.store import JsonStore
+
+ROOT = Path(__file__).resolve().parent.parent
+CALL = {"id": "call_abc", "metadata": {"record_id": "rec_1", "vendor_id": "printco", "round": 1}}
+MESSAGES = [
+    {"role": "bot", "message": "Hello, I'm an AI assistant.", "secondsFromStart": 0.5},
+    {"role": "system", "message": "internal", "secondsFromStart": 0.6},
+    {"role": "user", "message": "Four ninety per shirt.", "secondsFromStart": 7.25},
+]
 
 
-# -----------------------------------------------------------------------------
-# Fixtures
-# -----------------------------------------------------------------------------
-@pytest.fixture
-def sample_brief():
-    return {
-        "brief_id": "test-brief-01",
-        "item": "Test Server Enclosures",
-        "quantity": 50,
-        "unit": "units",
-        "starting_offer_per_unit": 1000.0,
-        "target_price_per_unit": 1200.0,
-        "walk_away_price_per_unit": 1450.0,
-        "required_delivery_timeline": "Within 4 weeks",
-        "desired_payment_terms": "Net 30 days",
-        "minimum_warranty_years": 3,
-        "negotiation_priorities": ["Price under $1200", "Free freight"],
-    }
+class FakeClient:
+    """Stands in for VapiClient; records the payloads it is given."""
+    def __init__(self):
+        self.created = []
+
+    async def create_call(self, payload):
+        self.created.append(payload)
+        return {"id": f"call_{len(self.created)}"}
+
+    async def get_call(self, call_id):
+        return {"id": call_id, "status": "ended", "endedReason": "customer-ended-call",
+                "artifact": {"messages": MESSAGES, "transcript": "x"}, "analysis": {"summary": "s"}}
 
 
 @pytest.fixture
-def sample_vendors():
-    return [
-        {
-            "id": "vendor-test-apex",
-            "name": "Apex Test Supply",
-            "contact_name": "Dave Miller",
-            "contact_title": "Director",
-            "list_price": 1650.0,
-            "price_floor": 1280.0,
-            "concession_step": 75.0,
-            "negotiation_style": "Fast-Talking",
-            "quirks": ["Mentions aluminum costs"],
-            "acceptable_payment_terms": ["Net 30"],
-            "standard_warranty_years": 3,
-        },
-        {
-            "id": "vendor-test-pacific",
-            "name": "Pacific Test Supply",
-            "contact_name": "Marcus Chen",
-            "contact_title": "VP Sales",
-            "list_price": 1420.0,
-            "price_floor": 1180.0,
-            "concession_step": 60.0,
-            "negotiation_style": "Deal-Closer",
-            "quirks": ["Mentions Austin competitor"],
-            "acceptable_payment_terms": ["Net 15"],
-            "standard_warranty_years": 2,
-        },
-    ]
+def settings(tmp_path):
+    return Settings(state_dir=tmp_path, config_dir=ROOT / "config", webhook_secret="s3cret")
 
 
 @pytest.fixture
-def temp_store(tmp_path):
-    store_file = tmp_path / "test_store.json"
-    return Store(store_file)
+def seeded(settings):
+    JsonStore(settings.state_dir / "state.json").save({
+        "buyer_assistant_id": "asst_buyer", "buyer_phone_number_id": "pn_buyer",
+        "vendors": {v: {"number": f"+1415555000{i}"} for i, v in enumerate(["printco", "stitchhub", "quickprint"])},
+    })
+    return settings
 
 
-# -----------------------------------------------------------------------------
-# 1. Config & Store Tests
-# -----------------------------------------------------------------------------
-def test_settings_initialization(tmp_path):
-    custom_settings = Settings(
-        vapi_api_key="test_api_key",
-        vapi_public_key="test_public_key",
-        data_dir=tmp_path / "data",
-        store_file_path=tmp_path / "data" / "store.json",
-    )
-    assert custom_settings.vapi_api_key == "test_api_key"
-    assert custom_settings.vapi_public_key == "test_public_key"
-    assert custom_settings.server_port == 8000
+@pytest.fixture
+def http(seeded):
+    return TestClient(create_app(seeded))
 
 
-@pytest.mark.asyncio
-async def test_store_atomic_operations(temp_store):
-    # Verify initial structure
-    all_assts = await temp_store.get_all_assistants()
-    assert all_assts["buyer"] is None
-    assert all_assts["vendors"] == {}
-
-    # Set buyer assistant
-    buyer_data = {"id": "asst_buyer_123", "name": "Alex Mercer"}
-    await temp_store.set_buyer_assistant(buyer_data)
-    retrieved_buyer = await temp_store.get_buyer_assistant()
-    assert retrieved_buyer["id"] == "asst_buyer_123"
-
-    # Set vendor assistant
-    vendor_data = {"id": "asst_vendor_456", "name": "Dave Miller"}
-    await temp_store.set_vendor_assistant("vendor-apex", vendor_data)
-    retrieved_vendor = await temp_store.get_vendor_assistant("vendor-apex")
-    assert retrieved_vendor["name"] == "Dave Miller"
-
-    # Verify atomic file integrity on disk
-    assert temp_store.file_path.exists()
-    with open(temp_store.file_path, "r", encoding="utf-8") as f:
-        disk_data = json.load(f)
-    assert disk_data["buyer_assistant"]["id"] == "asst_buyer_123"
+def post(http, msg, secret="s3cret"):
+    return http.post("/vapi/webhook", json={"message": msg}, headers={"X-Vapi-Secret": secret})
 
 
-@pytest.mark.asyncio
-async def test_store_call_operations(temp_store):
-    turn = Turn(role="buyer", message="Can you do $1200?", extracted_price=1200.0)
-    record = CallRecord(
-        call_id="call-test-01",
-        vendor_id="vendor-test-apex",
-        vendor_name="Apex Test",
-        assistant_id="asst_buyer_123",
-        status=CallStatus.IN_PROGRESS,
-        turns=[turn],
-    )
-    await temp_store.upsert_call(record)
-
-    loaded = await temp_store.get_call("call-test-01")
-    assert loaded is not None
-    assert loaded.status == CallStatus.IN_PROGRESS
-    assert len(loaded.turns) == 1
-    assert loaded.turns[0].extracted_price == 1200.0
+# ------------------------------------------------------------------ webhook
+def test_rejects_wrong_secret(http):
+    assert post(http, {"type": "status-update"}, secret="nope").status_code == 401
 
 
-# -----------------------------------------------------------------------------
-# 2. Prompts & Payloads Tests
-# -----------------------------------------------------------------------------
-def test_buyer_prompt_generation(sample_brief):
-    prompt = build_buyer_prompt(sample_brief)
-    assert "Alex Mercer" in prompt
-    assert "50 units" in prompt
-    assert "$1,000.00" in prompt
-    assert "$1,200.00" in prompt
-    assert "$1,450.00" in prompt
-    assert "HARD CEILING" in prompt
+def test_accepts_bearer_secret(http):
+    r = http.post("/vapi/webhook", json={"message": {"type": "hang"}}, headers={"Authorization": "Bearer s3cret"})
+    assert r.status_code == 200
 
 
-def test_vendor_prompt_generation(sample_brief, sample_vendors):
-    vendor = sample_vendors[0]
-    prompt = build_vendor_prompt(vendor, sample_brief)
-    assert "Dave Miller" in prompt
-    assert "Apex Test Supply" in prompt
-    assert "$1,650.00" in prompt
-    assert "$1,280.00" in prompt
-    assert "NEVER breach this floor" in prompt
+def test_bad_json(http):
+    r = http.post("/vapi/webhook", content="not json", headers={"X-Vapi-Secret": "s3cret"})
+    assert r.status_code == 400
 
 
-def test_assistant_payload_builders(sample_brief, sample_vendors):
-    buyer_payload = build_buyer_assistant_payload(
-        brief=sample_brief,
-        webhook_url="https://test.com/vapi/webhook",
-        webhook_secret="sec123",
-    )
-    assert "Buyer Agent" in buyer_payload["name"]
-    assert buyer_payload["serverUrl"] == "https://test.com/vapi/webhook"
-    assert buyer_payload["serverUrlSecret"] == "sec123"
-    assert buyer_payload["endCallFunctionEnabled"] is True
-    assert "analysisPlan" in buyer_payload
-
-    vendor_payload = build_vendor_assistant_payload(
-        vendor=sample_vendors[0],
-        brief=sample_brief,
-        webhook_url="https://test.com/vapi/webhook",
-    )
-    assert "Vendor Agent - Apex Test Supply" in vendor_payload["name"]
-    assert vendor_payload["voice"]["provider"] == "11labs"
+def test_full_event_sequence_builds_a_record(http):
+    post(http, {"type": "status-update", "status": "ringing", "call": CALL})
+    post(http, {"type": "status-update", "status": "in-progress", "call": CALL})
+    post(http, {"type": "transcript", "transcriptType": "partial", "role": "user", "transcript": "fo", "call": CALL})
+    post(http, {"type": "transcript", "transcriptType": "final", "role": "user", "transcript": "Four ninety.", "call": CALL})
+    post(http, {"type": "end-of-call-report", "endedReason": "customer-ended-call", "call": CALL,
+                "durationSeconds": 30, "cost": 0.2, "analysis": {"summary": "ok"},
+                "artifact": {"messages": MESSAGES, "transcript": "t", "recordingUrl": "u"}})
+    rec = http.get("/calls/call_abc").json()
+    assert rec["status"] == "completed" and rec["vendor_id"] == "printco"
+    assert [t["role"] for t in rec["turns"]] == ["agent", "vendor"]       # system line dropped
+    assert rec["turns"][1]["start_sec"] == 7.25                            # evidence timestamp kept
+    assert len(rec["live_turns"]) == 1                                     # partial ignored
+    assert rec["summary"] == "ok" and rec["recording_url"] == "u"
 
 
-# -----------------------------------------------------------------------------
-# 3. CallManager Outcome Classification & Scorecard Tests
-# -----------------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_call_manager_classification(temp_store, sample_brief, sample_vendors):
-    vapi_mock = VapiClient(api_key="mock")
-    manager = CallManager(
-        vapi_client=vapi_mock,
-        store=temp_store,
-        brief=sample_brief,
-        vendors=sample_vendors,
-    )
-
-    # 1. Deal accepted within mandate
-    call1 = CallRecord(
-        call_id="call-01",
-        vendor_id=sample_vendors[0]["id"],
-        vendor_name="Apex Test",
-        assistant_id="asst-01",
-    )
-    manager._classify_call_outcome(
-        call_record=call1,
-        structured_data={"deal_reached": True, "final_unit_price": 1280.0},
-    )
-    assert call1.outcome == NegotiationOutcome.DEAL_ACCEPTED
-    assert call1.deal_terms is not None
-    assert call1.deal_terms["unit_price"] == 1280.0
-
-    # 2. Walk away (above ceiling)
-    call2 = CallRecord(
-        call_id="call-02",
-        vendor_id=sample_vendors[0]["id"],
-        vendor_name="Apex Test",
-        assistant_id="asst-01",
-    )
-    manager._classify_call_outcome(
-        call_record=call2,
-        structured_data={"deal_reached": False, "final_unit_price": 1500.0},
-    )
-    assert call2.outcome == NegotiationOutcome.WALK_AWAY
-
-    # 3. Regex price extraction
-    extracted = manager._extract_price_from_text("Best I can do is $1,280.00 per unit today.")
-    assert extracted == 1280.0
+def test_events_for_unknown_calls_are_ignored(http):
+    assert post(http, {"type": "status-update", "status": "ringing", "call": {"id": "foreign"}}).status_code == 200
+    assert http.get("/calls").json() == []
 
 
-# -----------------------------------------------------------------------------
-# 4. Webhook & REST Endpoints Tests
-# -----------------------------------------------------------------------------
-def test_fastapi_endpoints():
-    client = TestClient(app)
-
-    # 1. Root health check
-    res = client.get("/")
-    assert res.status_code == 200
-    assert res.json()["service"] == "Vapi Negotiator"
-
-    # 2. Config endpoint
-    res_cfg = client.get("/api/config")
-    assert res_cfg.status_code == 200
-    assert "brief" in res_cfg.json()
-
-    # 3. Brief endpoint
-    res_brief = client.get("/api/brief")
-    assert res_brief.status_code == 200
-
-    # 4. Vendors endpoint
-    res_v = client.get("/api/vendors")
-    assert res_v.status_code == 200
-    assert isinstance(res_v.json(), list)
-
-    # 5. HTML Demo serving
-    res_html = client.get("/web_call_demo.html")
-    assert res_html.status_code == 200
-    assert "Vapi Voice Negotiator" in res_html.text
+# ------------------------------------------------------------ pure functions
+def test_classify():
+    t_vendor = [Turn(role="vendor", text="hi")]
+    assert classify("voicemail", []) == CallStatus.VOICEMAIL
+    assert classify("customer-did-not-answer", []) == CallStatus.NO_ANSWER
+    assert classify("customer-busy", []) == CallStatus.NO_ANSWER
+    assert classify("pipeline-error-openai-llm-failed", t_vendor) == CallStatus.FAILED
+    assert classify("customer-ended-call", t_vendor) == CallStatus.COMPLETED
+    assert classify("silence-timed-out", []) == CallStatus.NO_ANSWER
 
 
-def test_webhook_event_handling():
-    client = TestClient(app)
+def test_normalize_messages():
+    turns = normalize_messages(MESSAGES)
+    assert [(t.role, t.start_sec) for t in turns] == [("agent", 0.5), ("vendor", 7.25)]
 
-    # Status update webhook
-    event_payload = {
-        "message": {
-            "type": "status-update",
-            "status": "ringing",
-            "callId": "test-call-webhook-99",
-            "call": {"id": "test-call-webhook-99"},
-        }
-    }
-    res = client.post("/vapi/webhook", json=event_payload)
-    assert res.status_code == 200
-    assert res.json()["status"] == "ok"
+
+# ---------------------------------------------------------------- launching
+def test_launch_round_builds_correct_payloads(seeded):
+    fake = FakeClient()
+    m = build_manager(seeded, fake)
+    recs = asyncio.run(m.launch_round(2, ["printco", "quickprint"], {"printco": "another vendor said 430"}))
+    assert len(fake.created) == 2 and all(r.call_id for r in recs)
+    p = next(c for c in fake.created if c["customer"]["name"] == "PrintCo Tees")
+    assert p["assistantId"] == "asst_buyer" and p["phoneNumberId"] == "pn_buyer"
+    v = p["assistantOverrides"]["variableValues"]
+    assert v["competing_quote"] == "another vendor said 430" and v["round_number"] == "2"
+    assert all(isinstance(x, str) for x in v.values())                      # Vapi templating needs strings
+    assert p["metadata"]["vendor_id"] == "printco"
+    other = next(c for c in fake.created if c["customer"]["name"] != "PrintCo Tees")
+    assert other["assistantOverrides"]["variableValues"]["competing_quote"] == "none"
+
+
+def test_launch_without_bootstrap_marks_failed(settings):
+    m = build_manager(settings, FakeClient())
+    rec = asyncio.run(m.launch_call("printco"))
+    assert rec.status == CallStatus.FAILED and "bootstrap" in rec.error
+
+
+def test_event_arriving_before_create_call_returns_still_matches(seeded):
+    """Race: Vapi's first webhook can beat the POST /call response."""
+    m = build_manager(seeded, FakeClient())
+    m.on_status_update({"status": "ringing", "call": {"id": "call_early", "metadata": {"vendor_id": "printco", "record_id": "rec_x"}}})
+    assert m.get("call_early").record_id == "rec_x"
+
+
+def test_sync_from_api_and_completion_handler_fires_once(seeded):
+    m = build_manager(seeded, FakeClient())
+    seen = []
+    m.add_completion_handler(lambda rec: seen.append(rec.record_id))
+    rec = asyncio.run(m.launch_call("printco"))
+    asyncio.run(m.sync_from_api(rec.record_id))
+    asyncio.run(m.sync_from_api(rec.record_id))
+    assert rec.status == CallStatus.COMPLETED and seen == [rec.record_id]
+
+
+def test_records_survive_restart(seeded):
+    fake = FakeClient()
+    m1 = build_manager(seeded, fake)
+    rec = asyncio.run(m1.launch_call("stitchhub"))
+    m2 = build_manager(seeded, fake)
+    assert m2.get(rec.call_id).vendor_id == "stitchhub"

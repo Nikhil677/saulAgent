@@ -1,85 +1,67 @@
-"""Configuration management for Vapi Negotiator.
-
-Loads application settings and credentials from environment variables and .env file.
-"""
-
+"""Central configuration. Everything comes from environment variables / .env."""
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Base directory for the vapi-negotiator project
-BASE_DIR = Path(__file__).resolve().parent.parent
+from dotenv import load_dotenv
 
-
-class Settings(BaseSettings):
-    """Application settings and environment configuration."""
-    model_config = SettingsConfigDict(
-        env_file=str(BASE_DIR / ".env"),
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False
-    )
-
-    # Vapi API Credentials
-    vapi_api_key: str = Field(default="", description="Vapi Private API Key")
-    vapi_public_key: str = Field(default="", description="Vapi Public Key for web calls")
-    vapi_base_url: str = Field(default="https://api.vapi.ai", description="Vapi REST endpoint")
-
-    # Webhook Settings
-    webhook_url: str = Field(
-        default="http://localhost:8000/vapi/webhook",
-        description="Publicly reachable webhook endpoint for Vapi events"
-    )
-    webhook_secret: Optional[str] = Field(
-        default=None,
-        description="Optional secret token for authenticating webhook requests"
-    )
-
-    # Server Settings
-    server_host: str = Field(default="0.0.0.0", description="FastAPI bind host")
-    server_port: int = Field(default=8000, description="FastAPI port")
-
-    # File Paths
-    data_dir: Path = Field(
-        default=BASE_DIR / "data",
-        description="Directory for local state and store persistence"
-    )
-    store_file_path: Path = Field(
-        default=BASE_DIR / "data" / "store.json",
-        description="File path for JSON data store"
-    )
-    brief_file_path: Path = Field(
-        default=BASE_DIR / "config" / "brief.json",
-        description="File path for buyer brief specification"
-    )
-    vendors_file_path: Path = Field(
-        default=BASE_DIR / "config" / "vendors.json",
-        description="File path for vendor personas definition"
-    )
-
-    # Assistant & Model Defaults
-    default_model_provider: str = Field(default="openai")
-    default_model: str = Field(default="gpt-4o")
-    default_temperature: float = Field(default=0.7)
-
-    # Phone Number ID (Optional, for outbound telephony)
-    vapi_phone_number_id: Optional[str] = Field(
-        default=None,
-        description="Optional default outbound Vapi/Twilio phone number ID"
-    )
-
-    def ensure_directories(self) -> None:
-        """Create required runtime directories if they do not exist."""
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.store_file_path.parent.mkdir(parents=True, exist_ok=True)
-        self.brief_file_path.parent.mkdir(parents=True, exist_ok=True)
-        self.vendors_file_path.parent.mkdir(parents=True, exist_ok=True)
+ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT / ".env")
 
 
-# Global settings singleton
-settings = Settings()
-settings.ensure_directories()
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+@dataclass(frozen=True)
+class Settings:
+    vapi_api_key: str = ""
+    vapi_base_url: str = "https://api.vapi.ai"
+    public_base_url: str = ""          # e.g. https://abc.trycloudflare.com (no trailing slash)
+    webhook_secret: str = ""
+
+    llm_provider: str = "anthropic"
+    llm_model: str = ""                # must be set before creating assistants
+
+    buyer_voice_provider: str = "vapi"
+    buyer_voice_id: str = "Elliot"
+    vendor_voice_provider: str = "vapi"
+    vendor_voice_id: str = "Rohan"
+
+    transcriber_provider: str = "deepgram"
+    transcriber_model: str = "nova-2"
+    transcriber_language: str = "en"
+
+    max_call_seconds: int = 240
+    silence_timeout_seconds: int = 20
+    number_area_code: str = "415"
+
+    state_dir: Path = ROOT / "state"
+    config_dir: Path = ROOT / "config"
+
+    @property
+    def webhook_url(self) -> str:
+        return f"{self.public_base_url.rstrip('/')}/vapi/webhook" if self.public_base_url else ""
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        return cls(
+            vapi_api_key=_env("VAPI_API_KEY"),
+            vapi_base_url=_env("VAPI_BASE_URL", "https://api.vapi.ai"),
+            public_base_url=_env("PUBLIC_BASE_URL"),
+            webhook_secret=_env("VAPI_WEBHOOK_SECRET"),
+            llm_provider=_env("VAPI_LLM_PROVIDER", "anthropic"),
+            llm_model=_env("VAPI_LLM_MODEL"),
+            buyer_voice_provider=_env("BUYER_VOICE_PROVIDER", "vapi"),
+            buyer_voice_id=_env("BUYER_VOICE_ID", "Elliot"),
+            vendor_voice_provider=_env("VENDOR_VOICE_PROVIDER", "vapi"),
+            vendor_voice_id=_env("VENDOR_VOICE_ID", "Rohan"),
+            transcriber_provider=_env("TRANSCRIBER_PROVIDER", "deepgram"),
+            transcriber_model=_env("TRANSCRIBER_MODEL", "nova-2"),
+            transcriber_language=_env("TRANSCRIBER_LANGUAGE", "en"),
+            max_call_seconds=int(_env("MAX_CALL_SECONDS", "240")),
+            silence_timeout_seconds=int(_env("SILENCE_TIMEOUT_SECONDS", "20")),
+            number_area_code=_env("NUMBER_AREA_CODE", "415"),
+        )

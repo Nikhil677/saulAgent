@@ -1,64 +1,63 @@
-"""Vapi Webhook Endpoint.
+"""Receiver for Vapi server messages (POST /vapi/webhook).
 
-Receives, authenticates, and dispatches real-time call events, speech updates,
-and end-of-call reports from Vapi.ai servers.
+Every request body looks like {"message": {"type": "...", "call": {...}, ...}}.
+We answer fast (Vapi expects quick responses) and do slow work in background tasks.
 """
-
 from __future__ import annotations
 
+import hmac
 import logging
-from typing import Any, Dict, Optional
-from fastapi import APIRouter, Header, HTTPException, Request, status
 
-from app.config import settings
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 
-logger = logging.getLogger(__name__)
-
-router = APIRouter(prefix="/vapi", tags=["Webhook"])
+router = APIRouter()
+log = logging.getLogger("negotiator.webhook")
 
 
-@router.post("/webhook")
-async def receive_vapi_webhook(
+def _authorized(expected: str, x_vapi_secret: str | None, authorization: str | None) -> bool:
+    """Accept the secret as X-Vapi-Secret or as 'Authorization: Bearer <secret>'."""
+    if not expected:
+        return True  # no secret configured (dev only!)
+    candidates = [x_vapi_secret or ""]
+    if authorization and authorization.lower().startswith("bearer "):
+        candidates.append(authorization[7:])
+    return any(hmac.compare_digest(expected, c) for c in candidates)
+
+
+@router.post("/vapi/webhook")
+async def vapi_webhook(
     request: Request,
-    x_vapi_secret: Optional[str] = Header(None, alias="x-vapi-secret"),
-) -> Dict[str, Any]:
-    """Receive and process real-time call webhook events from Vapi."""
-    # Optional webhook secret verification
-    if settings.webhook_secret and x_vapi_secret != settings.webhook_secret:
-        # Check authorization header fallback
-        auth_header = request.headers.get("authorization", "")
-        if auth_header != f"Bearer {settings.webhook_secret}" and x_vapi_secret != settings.webhook_secret:
-            logger.warning("Unauthorized webhook request rejected.")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or missing webhook secret.",
-            )
+    background: BackgroundTasks,
+    x_vapi_secret: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+):
+    settings = request.app.state.settings
+    manager = request.app.state.manager
+
+    if not _authorized(settings.webhook_secret, x_vapi_secret, authorization):
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
 
     try:
-        body: Dict[str, Any] = await request.json()
-    except Exception as e:
-        logger.error("Failed to decode webhook JSON: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Malformed JSON body",
-        )
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="body is not valid JSON")
 
-    message = body.get("message", body)
-    message_type = message.get("type", "unknown")
-    logger.info("Received Vapi webhook message: type=%s", message_type)
+    msg = body.get("message") or {}
+    mtype = msg.get("type")
 
-    # Handle dynamic assistant request if requested by Vapi
-    if message_type == "assistant-request":
-        call_manager = getattr(request.app.state, "call_manager", None)
-        buyer_assistant = await request.app.state.store.get_buyer_assistant()
-        if buyer_assistant and "payload" in buyer_assistant:
-            return {"assistant": buyer_assistant["payload"]}
-        return {}
+    if mtype == "status-update":
+        manager.on_status_update(msg)
+    elif mtype == "transcript":
+        manager.on_transcript(msg)
+    elif mtype == "end-of-call-report":
+        rec = manager.on_end_of_call_report(msg)
+        if rec is not None:
+            # Your extraction / scoring runs here, AFTER we have replied to Vapi.
+            background.add_task(manager.dispatch_completion, rec)
+    elif mtype == "hang":
+        log.warning("assistant hang detected (slow model/tool response)")
+    else:
+        log.debug("ignored webhook type: %s", mtype)
 
-    call_manager = getattr(request.app.state, "call_manager", None)
-    if not call_manager:
-        logger.warning("CallManager not initialized on app state.")
-        return {"status": "uninitialized"}
-
-    result = await call_manager.handle_webhook_event(body)
-    return {"status": "ok", "result": result}
+    # No webhook type we handle needs a response body, so an empty OK is correct.
+    return {"ok": True}
