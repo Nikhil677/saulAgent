@@ -1,0 +1,28 @@
+{
+  "brief_id": "brief-2026-server-racks",
+  "item": "Industrial 42U Server Enclosures (Seismic & Soundproofed)",
+  "quantity": 50,
+  "unit": "units",
+  "currency": "USD",
+  "starting_offer_per_unit": 1050.00,
+  "target_price_per_unit": 1200.00,
+  "walk_away_price_per_unit": 1450.00,
+  "target_total_budget": 60000.00,
+  "maximum_total_budget": 72500.00,
+  "required_delivery_timeline": "Within 4 weeks",
+  "desired_payment_terms": "Net 30 days",
+  "minimum_warranty_years": 3,
+  "negotiation_priorities": [
+    "Lock in unit price at or below $1,200",
+    "Absolute ceiling is $1,450; walk away if the vendor refuses to meet or beat this",
+    "Request bundled freight / free shipping given the 50-unit volume",
+    "Seek Net 30 or Net 45 payment terms instead of upfront deposit",
+    "Secure minimum 3-year enterprise manufacturer replacement warranty"
+  ],
+  "negotiation_rules": {
+    "open_aggressively": true,
+    "never_exceed_walk_away": true,
+    "require_written_confirmation_summary": true,
+    "concession_increment_max": 75.00
+  }
+}
